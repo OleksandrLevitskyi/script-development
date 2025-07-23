@@ -18,6 +18,7 @@ import subprocess
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import queue
+import shutil
 import logging
 
 # GUI imports
@@ -161,14 +162,34 @@ class HighQualityImageProcessor:
             "zoom_bottom_right": (width * 3 // 4, height * 3 // 4),
         }
         
+        dx = dy = 0
         if effect_type == "static":
             breathing = 0.02 * math.sin(smooth_progress * math.pi * 2)
             scale = 1.0 + breathing
             center_x, center_y = width // 2, height // 2
         else:
             center_x, center_y = centers.get(effect_type, (width // 2, height // 2))
+            if effect_type == "sway_lr":
+                dx = int(width * 0.02 * math.sin(smooth_progress * 2 * math.pi))
+            elif effect_type == "sway_ud":
+                dy = int(height * 0.02 * math.sin(smooth_progress * 2 * math.pi))
+            elif effect_type == "pan_left":
+                dx = int(-width * 0.05 * smooth_progress)
+            elif effect_type == "pan_right":
+                dx = int(width * 0.05 * smooth_progress)
+            elif effect_type == "pan_up":
+                dy = int(-height * 0.05 * smooth_progress)
+            elif effect_type == "pan_down":
+                dy = int(height * 0.05 * smooth_progress)
+            elif effect_type == "zoom_sway":
+                dx = int(width * 0.02 * math.sin(smooth_progress * 2 * math.pi))
+            elif effect_type == "zoom_pan":
+                dx = int(width * 0.05 * smooth_progress)
+                dy = int(height * 0.02 * smooth_progress)
         
         M = cv2.getRotationMatrix2D((center_x, center_y), 0, scale)
+        M[0, 2] += dx
+        M[1, 2] += dy
         
         try:
             if self.cuda_available:
@@ -267,7 +288,62 @@ class EnhancedTTSProcessor:
             rate=rate_param
         )
         await communicate.save(str(output_file))
-        
+
+        return output_file
+
+    def generate_speech(self, text: str, output_file: Path, config: dict,
+                        progress_callback=None, chunk_size: int = 5000,
+                        retries: int = 3):
+        """Синтез речи с автоматическим разбиением текста и повторами."""
+        paragraphs = [p.strip() for p in text.splitlines() if p.strip()]
+        chunks = []
+        current = ""
+        for p in paragraphs:
+            if len(current) + len(p) + 1 <= chunk_size:
+                current += ("\n" if current else "") + p
+            else:
+                if current:
+                    chunks.append(current)
+                current = p
+        if current:
+            chunks.append(current)
+
+        temp_files = []
+        for i, chunk in enumerate(chunks):
+            tmp = output_file.with_name(f"{output_file.stem}_{i}.mp3")
+            success = False
+            for attempt in range(retries):
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    loop.run_until_complete(self.text_to_speech(chunk, tmp, config))
+                    success = True
+                    break
+                except Exception as e:
+                    logger.warning(f"TTS chunk {i} attempt {attempt+1} failed: {e}")
+                    time.sleep(1)
+                finally:
+                    loop.close()
+            if not success:
+                raise Exception("TTS generation failed")
+            temp_files.append(tmp)
+            if progress_callback:
+                pct = (i + 1) / len(chunks) * 100
+                progress_callback(f"🔊 Voice generation: {pct:.1f}%")
+
+        if len(temp_files) == 1:
+            shutil.move(str(temp_files[0]), str(output_file))
+        else:
+            concat_list = output_file.with_suffix('.list')
+            with open(concat_list, 'w', encoding='utf-8') as f:
+                for tf in temp_files:
+                    f.write(f"file '{tf.as_posix()}'\n")
+            cmd = ['ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', str(concat_list),
+                   '-c', 'copy', str(output_file)]
+            subprocess.run(cmd, capture_output=True)
+            concat_list.unlink()
+            for tf in temp_files:
+                tf.unlink()
         return output_file
 
 class AdvancedSlideshowGenerator:
@@ -276,7 +352,9 @@ class AdvancedSlideshowGenerator:
     def __init__(self, config: dict):
         self.motion_effects = [
             "zoom_center", "zoom_left", "zoom_right", "zoom_top", "zoom_bottom",
-            "zoom_top_left", "zoom_top_right", "zoom_bottom_left", "zoom_bottom_right", "static"
+            "zoom_top_left", "zoom_top_right", "zoom_bottom_left", "zoom_bottom_right",
+            "sway_lr", "sway_ud", "pan_left", "pan_right", "pan_up", "pan_down",
+            "zoom_sway", "zoom_pan", "static"
         ]
         self.processor = HighQualityImageProcessor(quality_mode=config.get('image_quality', 'high'))
     
@@ -312,7 +390,8 @@ class AdvancedSlideshowGenerator:
             
             # Предобработка изображений
             processed_images = []
-            with ThreadPoolExecutor(max_workers=4) as executor:
+            workers = max(os.cpu_count() - 1, 1)
+            with ThreadPoolExecutor(max_workers=workers) as executor:
                 futures = [executor.submit(self.processor.preprocess_image, img_path) 
                           for img_path in extended_images]
                 
@@ -602,6 +681,91 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         result = subprocess.run(cmd, capture_output=True, text=True)
         return result.returncode == 0
 
+    def get_duration(self, file: Path) -> float:
+        result = subprocess.run([
+            'ffprobe', '-i', str(file), '-show_entries', 'format=duration',
+            '-v', 'quiet', '-of', 'csv=p=0'
+        ], capture_output=True, text=True)
+        if result.returncode == 0:
+            try:
+                return float(result.stdout.strip())
+            except ValueError:
+                pass
+        return 0.0
+
+    def compose_final_video(self, main_video: Path, output_file: Path,
+                             intro: Path = None, outro: Path = None,
+                             auth: Path = None, progress_callback=None):
+        """Добавить intro/outro и видео веб-камеры."""
+        temp_video = main_video
+
+        if auth and auth.exists():
+            if progress_callback:
+                progress_callback("🎥 Adding webcam overlay...")
+            main_dur = self.get_duration(main_video)
+            auth_dur = self.get_duration(auth)
+            loops = max(1, math.ceil(main_dur / max(auth_dur, 0.1)))
+            parts = []
+            for i in range(loops):
+                part = auth.with_name(f"auth_part_{i}.mp4")
+                vf = f"fps=15{',hflip' if i % 2 == 1 else ''}"
+                subprocess.run(['ffmpeg', '-y', '-i', str(auth), '-an', '-vf', vf, str(part)], capture_output=True)
+                parts.append(part)
+            lst = auth.with_suffix('.txt')
+            with open(lst, 'w') as f:
+                for p in parts:
+                    f.write(f"file '{p.as_posix()}'\n")
+            extended = auth.with_name('auth_extended.mp4')
+            subprocess.run(['ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', str(lst),
+                            '-c', 'copy', str(extended)], capture_output=True)
+            for p in parts:
+                p.unlink()
+            lst.unlink()
+            subprocess.run([
+                'ffmpeg', '-y', '-i', str(temp_video), '-i', str(extended),
+                '-filter_complex', '[1:v]scale=iw/4:-1[ov];[0:v][ov]overlay=10:H-h-10:shortest=1',
+                '-map', '0:a?', '-c:v', 'libx264', '-c:a', 'copy', str(output_file)
+            ], capture_output=True)
+            temp_video = output_file
+            extended.unlink()
+
+        files_to_concat = []
+        if intro and intro.exists():
+            if progress_callback:
+                progress_callback("🔗 Adding intro clip")
+            intro_res = intro.with_name('intro_resized.mp4')
+            width = int(subprocess.getoutput(f"ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 {temp_video}").strip())
+            height = int(subprocess.getoutput(f"ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 {temp_video}").strip())
+            subprocess.run(['ffmpeg', '-y', '-i', str(intro), '-vf',
+                            f'scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1',
+                            '-c:v', 'libx264', '-c:a', 'copy', str(intro_res)], capture_output=True)
+            files_to_concat.append(intro_res)
+        files_to_concat.append(temp_video)
+        if outro and outro.exists():
+            if progress_callback:
+                progress_callback("🔗 Adding outro clip")
+            outro_res = outro.with_name('outro_resized.mp4')
+            width = int(subprocess.getoutput(f"ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 {temp_video}").strip())
+            height = int(subprocess.getoutput(f"ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 {temp_video}").strip())
+            subprocess.run(['ffmpeg', '-y', '-i', str(outro), '-vf',
+                            f'scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1',
+                            '-c:v', 'libx264', '-c:a', 'copy', str(outro_res)], capture_output=True)
+            files_to_concat.append(outro_res)
+
+        if len(files_to_concat) > 1:
+            lst = output_file.with_suffix('.concat')
+            with open(lst, 'w') as f:
+                for p in files_to_concat:
+                    f.write(f"file '{p.as_posix()}'\n")
+            subprocess.run(['ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', str(lst),
+                            '-c', 'copy', str(output_file)], capture_output=True)
+            lst.unlink()
+            for p in files_to_concat:
+                if p != temp_video:
+                    p.unlink()
+        elif temp_video != output_file:
+            shutil.move(str(temp_video), str(output_file))
+
 class UltimateVideoProductionPipeline:
     """Продвинутый пайплайн производства видео с максимальным качеством"""
     
@@ -709,14 +873,12 @@ class UltimateVideoProductionPipeline:
             with open(text_file, 'r', encoding='utf-8') as f:
                 text_content = f.read().strip()
             
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                loop.run_until_complete(
-                    self.tts_processor.text_to_speech(text_content, voice_file, config)
-                )
-            finally:
-                loop.close()
+            self.tts_processor.generate_speech(
+                text_content,
+                voice_file,
+                config,
+                lambda m: self.progress_callback(f"{folder_name}: {m}") if self.progress_callback else None
+            )
             
             # Получаем длительность озвучки
             audio_duration = self.get_audio_duration(voice_file)
@@ -769,11 +931,24 @@ class UltimateVideoProductionPipeline:
             if not self.video_merger.add_colored_subtitles_to_video(temp_video, subtitle_file, final_video):
                 logger.error(f"❌ Failed to add colored subtitles for {folder_name}")
                 return False
-            
-            # Очистка временных файлов
+
+            base = video_folder.parent
+            intro = next((base / 'intro').glob('*.mp4'), None) if (base / 'intro').exists() else None
+            outro = next((base / 'outro').glob('*.mp4'), None) if (base / 'outro').exists() else None
+            auth = next((base / 'auth').glob('*.mp4'), None) if (base / 'auth').exists() else None
+
+            self.video_merger.compose_final_video(
+                final_video,
+                final_video,
+                intro,
+                outro,
+                auth,
+                lambda m: self.progress_callback(f"{folder_name}: {m}") if self.progress_callback else None,
+            )
+
             if temp_audio.exists():
                 temp_audio.unlink()
-            
+
             logger.info(f"✅ {folder_name}: Complete! Final video: {final_video}")
             return True
             
