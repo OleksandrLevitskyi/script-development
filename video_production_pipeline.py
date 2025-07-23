@@ -527,7 +527,13 @@ class PrecisionVideoMerger:
             return False
     
     def generate_colored_subtitles(self, audio_file: Path, subtitle_file: Path, config: dict):
-        """Генерация цветных субтитров с word-level timestamps"""
+        """Генерация цветных субтитров с word-level timestamps.
+
+        Для разнообразия поддерживается несколько стилей оформления. Каждый
+        запуск случайно выбирает один из готовых пресетов шрифтов и
+        параметров. Цвета при этом берутся из конфигурации, чтобы пользователь
+        мог легко их изменить.
+        """
         try:
             logger.info("🤖 Loading Whisper model...")
             model = whisper.load_model("base")
@@ -559,14 +565,32 @@ class PrecisionVideoMerger:
         primary_color = config.get('subtitle_colors', {}).get('primary', '&H00FFFF&')    # желтый
         secondary_color = config.get('subtitle_colors', {}).get('secondary', '&HFFFFFF&') # белый
         
-        # ASS заголовок
-        ass_content = """[Script Info]
+        # Набор различных стилей субтитров
+        preset_styles = [
+            ("Poppins ExtraBold", 48, 3, 2),
+            ("Impact", 48, 3, 2),
+            ("Arial Black", 46, 2, 2),
+            ("Roboto Black", 46, 2, 2),
+            ("Open Sans ExtraBold", 44, 2, 2),
+            ("Oswald Bold", 50, 3, 2),
+            ("Lato Heavy", 48, 2, 1),
+            ("Helvetica Neue Bold", 46, 2, 2),
+            ("Futura Condensed ExtraBold", 48, 3, 2),
+            ("Franklin Gothic Heavy", 48, 3, 2),
+        ]
+
+        font, font_size, outline, shadow = random.choice(preset_styles)
+        alignment = random.choice([2, 8])  # 2 - центр, 8 - низ
+        margin_v = 40 if alignment == 8 else 20
+
+        # ASS заголовок с выбранным стилем
+        ass_content = f"""[Script Info]
 Title: Generated Colored Subtitles
 ScriptType: v4.00+
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Arial Black,28,&Hffffff,&Hffffff,&H000000,&H80000000,1,0,0,0,100,100,0,0,1,3,2,5,10,10,40,1
+Style: Default,{font},{font_size},{primary_color},{secondary_color},&H000000,&H80000000,1,0,0,0,100,100,0,0,1,{outline},{shadow},{alignment},10,10,{margin_v},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -697,7 +721,14 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                              intro: Path = None, outro: Path = None,
                              auth: Path = None, progress_callback=None):
         """Добавить intro/outro и видео веб-камеры."""
+        # При записи поверх исходного файла FFmpeg может ошибаться, поэтому
+        # используем временный файл, если путь вывода совпадает с входом.
         temp_video = main_video
+        intermediate = None
+        if output_file.resolve() == main_video.resolve():
+            intermediate = output_file.with_name(output_file.stem + '_tmp.mp4')
+        else:
+            intermediate = output_file
 
         if auth and auth.exists():
             if progress_callback:
@@ -724,9 +755,9 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             subprocess.run([
                 'ffmpeg', '-y', '-i', str(temp_video), '-i', str(extended),
                 '-filter_complex', '[1:v]scale=iw/4:-1[ov];[0:v][ov]overlay=10:H-h-10:shortest=1',
-                '-map', '0:a?', '-c:v', 'libx264', '-c:a', 'copy', str(output_file)
+                '-map', '0:a?', '-c:v', 'libx264', '-c:a', 'copy', str(intermediate)
             ], capture_output=True)
-            temp_video = output_file
+            temp_video = intermediate
             extended.unlink()
 
         files_to_concat = []
@@ -763,6 +794,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             for p in files_to_concat:
                 if p != temp_video:
                     p.unlink()
+            if temp_video != output_file and Path(temp_video).exists():
+                Path(temp_video).unlink()
         elif temp_video != output_file:
             shutil.move(str(temp_video), str(output_file))
 
